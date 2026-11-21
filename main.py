@@ -1,9 +1,17 @@
 import io
+import math
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
+
+# ※ set_page_config 는 반드시 첫 번째 Streamlit 명령이어야 합니다.
+st.set_page_config(page_title="극지식물 생육 상관관계 분석", layout="wide")
+
+FONT_FAMILY = "Malgun Gothic, Apple SD Gothic Neo, Noto Sans KR, sans-serif"
+PALETTE = ["#4C72B0", "#55A868", "#C44E52", "#8172B3", "#CCB974", "#64B5CD"]
 
 # ── 한글 폰트 CSS ──────────────────────────────────────────────────────────
 st.markdown("""
@@ -15,18 +23,25 @@ html, body, [class*="css"] {
 </style>
 """, unsafe_allow_html=True)
 
-# ── 캐시된 CSV 읽기 ────────────────────────────────────────────────────────
+
+# ── 캐시된 CSV 읽기 (바이트 기준으로 캐시) ─────────────────────────────────
 @st.cache_data
-def read_csv(file):
-    if file is None:
+def read_csv_bytes(data):
+    if not data:
         return pd.DataFrame()
-    data = file.getvalue()
     for enc in ("utf-8-sig", "cp949"):
         try:
             return pd.read_csv(io.BytesIO(data), encoding=enc)
         except Exception:
             pass
     return pd.DataFrame()
+
+
+def read_csv(file):
+    if file is None:
+        return pd.DataFrame()
+    return read_csv_bytes(file.getvalue())
+
 
 # ── 열 이름 표준화 ─────────────────────────────────────────────────────────
 def std_cols(df):
@@ -67,7 +82,7 @@ def std_cols(df):
             num = pd.to_numeric(
                 df[c].astype(str).str.replace(",", "")
                 .str.extract(r"(-?\d+\.?\d*)")[0],
-                errors="coerce"
+                errors="coerce",
             )
             if num.notna().mean() >= 0.5:
                 df[c] = num
@@ -86,65 +101,37 @@ def std_cols(df):
         df["time"] = parsed
     return df
 
-# ── 추세선 추가 헬퍼 ───────────────────────────────────────────────────────
-def add_trendline(fig, x, y, color="red", dash="dash"):
-    valid = pd.concat([x, y], axis=1).dropna()
+
+# ── 상관계수 / 기울기 계산 ─────────────────────────────────────────────────
+def calc_pair(df, xl, yl):
+    """(r, slope, intercept, valid) 반환. 계산 불가 시 r=None."""
+    valid = df[[xl, yl]].dropna()
     if len(valid) < 2:
-        return
-    xx = valid.iloc[:, 0].values
-    yy = valid.iloc[:, 1].values
+        return None, None, None, valid
+    xx = valid[xl].values.astype(float)
+    yy = valid[yl].values.astype(float)
+    if np.std(xx) == 0 or np.std(yy) == 0:
+        return None, None, None, valid
+    r = float(np.corrcoef(xx, yy)[0, 1])
     slope, intercept = np.polyfit(xx, yy, 1)
-    line_x = np.array([xx.min(), xx.max()])
-    line_y = slope * line_x + intercept
-    fig.add_trace(
-        go.Scatter(
-            x=line_x, y=line_y,
-            mode="lines",
-            line=dict(color=color, dash=dash, width=2),
-            name=f"추세선 (기울기={slope:.3f})",
-            hoverinfo="skip",
-        ),
-    )
+    return r, float(slope), float(intercept), valid
 
-# ── 산점도 트레이스 추가 헬퍼 ───────────────────────────────────────────────
-def scatter_trace(fig, x, y, color="skyblue"):
-    valid = pd.concat([x, y], axis=1).dropna()
-    if len(valid) < 2:
-        return None, None
-    xx = valid.iloc[:, 0].values
-    yy = valid.iloc[:, 1].values
-    r = np.corrcoef(xx, yy)[0, 1]
-    fig.add_trace(
-        go.Scatter(
-            x=xx, y=yy,
-            mode="markers",
-            marker=dict(color=color, size=8, opacity=0.7,
-                        line=dict(width=0.5)),
-            name=f"{x.name} vs {y.name}",
-            hoverinfo="x+y",
-        ),
-    )
-    return r, valid
 
-# ── 사이드바 ──────────────────────────────────────────────────────────────
-st.sidebar.title("📁 데이터 업로드")
-env_file = st.sidebar.file_uploader("환경 데이터 CSV", type="csv")
-growth_file = st.sidebar.file_uploader("생육 결과 CSV", type="csv")
+def interpret_r(r):
+    if r is None:
+        return "계산 불가 (값이 일정하거나 표본 부족)"
+    if r >= 0.7:
+        return "강한 양의 상관 ✅"
+    if r >= 0.3:
+        return "약한 양의 상관"
+    if r > -0.3:
+        return "거의 상관 없음 ➖"
+    if r >= -0.7:
+        return "약한 음의 상관"
+    return "강한 음의 상관"
 
-growth_measures = st.sidebar.multiselect(
-    "📊 생육 측정 항목 (그래프에 포함)",
-    ["잎 수", "지상부 길이", "지하부 길이", "지상부 질량", "지하부 질량", "생중량"],
-    default=["잎 수", "지상부 길이", "지하부 길이", "지상부 질량", "지하부 질량"],
-)
 
-# 데이터 로드
-with st.spinner("데이터 로딩 중..."):
-    raw_env = read_csv(env_file)
-    raw_growth = read_csv(growth_file)
-    env_df = std_cols(raw_env)
-    growth_df = std_cols(raw_growth)
-
-# 학교명 추출 (파일명에서)
+# ── 학교명 추출 (파일명에서) ───────────────────────────────────────────────
 def school_name(filename):
     if filename is None:
         return "미확인 학교"
@@ -164,22 +151,41 @@ def school_name(filename):
             parts.append(buf)
     return " ".join(p for p in parts if p).strip() or "미확인 학교"
 
+
+# ── 사이드바 ──────────────────────────────────────────────────────────────
+st.sidebar.title("📁 데이터 업로드")
+env_file = st.sidebar.file_uploader("환경 데이터 CSV", type="csv")
+growth_file = st.sidebar.file_uploader("생육 결과 CSV", type="csv")
+
+growth_measures = st.sidebar.multiselect(
+    "📊 생육 측정 항목 (그래프에 포함)",
+    ["잎 수", "지상부 길이", "지하부 길이", "지상부 질량", "지하부 질량", "생중량"],
+    default=["잎 수", "지상부 길이", "지하부 길이", "지상부 질량", "지하부 질량"],
+)
+
+# 데이터 로드
+with st.spinner("데이터 로딩 중..."):
+    raw_env = read_csv(env_file)
+    raw_growth = read_csv(growth_file)
+    env_df = std_cols(raw_env)
+    growth_df = std_cols(raw_growth)
+
 school = school_name(
     env_file.name if env_file else (growth_file.name if growth_file else None)
 )
 
-st.set_page_config(page_title="극지식물 생육 상관관계 분석", layout="wide")
 st.title("🌿 지상부 요소로 지하부 상태 예측하기: 극지식물 생육 상관관계 분석")
 st.caption(f"분석 대상: {school}")
+
+tab1, tab2, tab3 = st.tabs(["1장 핵심 질문", "2장 생육 결과", "3장 실생활 활용"])
 
 # ══════════════════════════════════════════════════════════════════════════
 # 탭 1 ─ 핵심 질문 / 실용적 이익 / 가설
 # ══════════════════════════════════════════════════════════════════════════
-tab1, tab2, tab3 = st.tabs(["1장 핵심 질문", "2장 생육 결과", "3장 실생활 활용"])
-
 with tab1:
     try:
-        st.info("환경 데이터가 업로드되지 않았어요. 이 탭의 내용은 생육 데이터만으로도 볼 수 있어요.")
+        if env_df.empty:
+            st.info("환경 데이터가 업로드되지 않았어요. 이 탭의 내용은 생육 데이터만으로도 볼 수 있어요.")
         st.header("1장 핵심 질문")
         st.markdown("""
 **❓ 질문 1: 지상부(잎·줄기)를 보면 지하부(뿌리) 상태를 예측할 수 있을까?**
@@ -231,162 +237,164 @@ with tab2:
             st.info("📎 생육 결과 CSV를 업로드하면 이 탭의 분석을 볼 수 있어요.")
         else:
             has_id = "개체번호" in growth_df.columns
-            avail = [c for c in growth_df.columns if c not in ("개체번호", "time")]
-            sel = [m for m in growth_measures if m in avail]
 
             st.header("2장 생육 결과 — 상관관계 분석")
 
             # ── 기본 지표 카드 ─────────────────────────────────────────────
-            if "지상부 길이" in growth_df.columns:
-                v = growth_df["지상부 길이"].dropna()
-                c1, c2, c3 = st.columns(3)
-                c1.metric("지상부 길이 평균 (mm)", f"{v.mean():.1f}")
-                c2.metric("지상부 길이 최대 (mm)", f"{v.max():.1f}")
-                c3.metric("지상부 길이 최소 (mm)", f"{v.min():.1f}")
+            for label in ("지상부 길이", "지하부 길이"):
+                if label in growth_df.columns:
+                    v = growth_df[label].dropna()
+                    if len(v) > 0:
+                        c1, c2, c3 = st.columns(3)
+                        c1.metric(f"{label} 평균 (mm)", f"{v.mean():.1f}")
+                        c2.metric(f"{label} 최대 (mm)", f"{v.max():.1f}")
+                        c3.metric(f"{label} 최소 (mm)", f"{v.min():.1f}")
 
-            if "지하부 길이" in growth_df.columns:
-                v = growth_df["지하부 길이"].dropna()
-                c1, c2, c3 = st.columns(3)
-                c1.metric("지하부 길이 평균 (mm)", f"{v.mean():.1f}")
-                c2.metric("지하부 길이 최대 (mm)", f"{v.max():.1f}")
-                c3.metric("지하부 길이 최소 (mm)", f"{v.min():.1f}")
-
-            # ── 분석 대상 열 ───────────────────────────────────────────────
-            gcols = [
-                c for c in [
-                    "잎 수", "지상부 길이", "지하부 길이",
-                    "지상부 질량", "지하부 질량", "생중량",
-                ]
-                if c in growth_df.columns
-            ]
+            # ── 분석 대상 열 (사이드바 선택 반영) ─────────────────────────
+            all_cols = ["잎 수", "지상부 길이", "지하부 길이",
+                        "지상부 질량", "지하부 질량", "생중량"]
+            gcols = [c for c in all_cols
+                     if c in growth_df.columns and c in growth_measures]
 
             if not gcols:
-                st.info("생육 CSV에 분석 가능한 숫자 열이 없어요.")
+                st.info("표시할 생육 측정 항목이 없어요. 사이드바에서 항목을 선택하거나 CSV의 열 이름을 확인해 주세요.")
             else:
                 # ── 그래프 1: 개체별 지표 분포 (박스 플롯) ────────────────
                 st.subheader("📦 개체별 생육 지표 분포")
+                n_box = len(gcols)
+                box_cols = min(n_box, 3)
+                box_rows = math.ceil(n_box / box_cols)
                 fig_box = make_subplots(
-                    rows=1, cols=len(gcols),
+                    rows=box_rows, cols=box_cols,
                     subplot_titles=gcols,
                     horizontal_spacing=0.08,
+                    vertical_spacing=0.18 if box_rows > 1 else 0.1,
                 )
-                box_colors = [
-                    "#4C72B0", "#55A868", "#C44E52",
-                    "#8172B3", "#CCB974", "#64B5CD",
-                ]
                 for i, col_name in enumerate(gcols):
                     vals = growth_df[[col_name]].dropna()
-                    if has_id and "개체번호" in growth_df.columns:
-                        ids = growth_df.loc[vals.index, "개체번호"]
+                    if has_id:
+                        ids = growth_df.loc[vals.index, "개체번호"].astype(str).tolist()
                     else:
-                        ids = [str(i) for i in range(len(vals))]
+                        ids = [str(j) for j in range(len(vals))]
+                    color = PALETTE[i % len(PALETTE)]
                     fig_box.add_trace(
                         go.Box(
                             y=vals[col_name].values,
                             name=col_name,
-                            fillcolor=box_colors[i % len(box_colors)],
-                            marker=dict(color=box_colors[i % len(box_colors)]),
-                            line=dict(color=box_colors[i % len(box_colors)]),
-                            hovertext=list(ids),
+                            fillcolor=color,
+                            marker=dict(color=color),
+                            line=dict(color=color),
+                            hovertext=ids,
                             hoverinfo="y+text",
                         ),
-                        row=1, col=i + 1,
+                        row=i // box_cols + 1, col=i % box_cols + 1,
                     )
                 fig_box.update_layout(
                     showlegend=False,
-                    font=dict(family="Malgun Gothic, Apple SD Gothic Neo, sans-serif"),
-                    height=350,
+                    font=dict(family=FONT_FAMILY),
+                    height=320 * box_rows,
+                    margin=dict(l=40, r=20, t=60, b=30),
                 )
                 st.plotly_chart(fig_box, width="stretch")
 
-                # ── 산점도: 상관계수 & 추세선 ─────────────────────────────
+                # ── 그래프 2: 상관관계 산점도 (격자 배치) ─────────────────
                 st.subheader("🔗 상관관계 산점도 (추세선 + 상관계수)")
 
-                xlabel_candidates = ["잎 수", "지상부 길이", "지상부 질량", "생중량"]
-                ylabel_candidates = ["지하부 길이", "지하부 질량"]
+                x_candidates = [c for c in ["잎 수", "지상부 길이", "지상부 질량", "생중량"]
+                                if c in growth_df.columns and c in growth_measures]
+                y_candidates = [c for c in ["지하부 길이", "지하부 질량"]
+                                if c in growth_df.columns and c in growth_measures]
 
-                # 각 pair에 대해 r값을 미리 계산해 둠
-                pairs_with_r = []
-                for xl in xlabel_candidates:
-                    if xl not in growth_df.columns:
-                        continue
-                    for yl in ylabel_candidates:
-                        if yl not in growth_df.columns:
-                            continue
-                        valid = growth_df[[xl, yl]].dropna()
-                        if len(valid) >= 2:
-                            r = np.corrcoef(valid[xl], valid[yl])[0, 1]
-                        else:
-                            r = 0.0
-                        pairs_with_r.append((xl, yl, r, valid))
+                pairs = []  # (xl, yl, r, slope, intercept, valid)
+                for xl in x_candidates:
+                    for yl in y_candidates:
+                        r, slope, intercept, valid = calc_pair(growth_df, xl, yl)
+                        pairs.append((xl, yl, r, slope, intercept, valid))
 
-                if not pairs_with_r:
-                    st.info("상관관계 분석에 필요한 열이 생육 CSV에 없어요.")
+                if not pairs:
+                    st.info("상관관계 분석에 필요한 열이 생육 CSV에 없어요. (X: 잎 수·지상부 길이·지상부 질량·생중량 / Y: 지하부 길이·지하부 질량)")
                 else:
-                    # ── subplot title에 r값까지 포함 ───────────────────────
-                    subplot_titles = [
-                        f"{xl} vs {yl} (r={r:.3f})"
-                        for xl, yl, r, _ in pairs_with_r
-                    ]
-                    n = len(pairs_with_r)
-                    fig_corr = make_subplots(
-                        rows=1, cols=n,
-                        subplot_titles=subplot_titles,
-                        horizontal_spacing=0.10,
-                    )
-                    colors_list = [
-                        "#4C72B0", "#55A868", "#C44E52",
-                        "#8172B3", "#CCB974", "#64B5CD",
-                    ]
-                    for idx, (xl, yl, r, valid) in enumerate(pairs_with_r):
-                        scatter_trace(
-                            fig_corr,
-                            growth_df[xl],
-                            growth_df[yl],
-                            color=colors_list[idx % len(colors_list)],
-                        )
-                        add_trendline(fig_corr, valid.iloc[:, 0], valid.iloc[:, 1])
+                    n = len(pairs)
+                    ncols = min(n, 3)
+                    nrows = math.ceil(n / ncols)
 
+                    titles = []
+                    for xl, yl, r, slope, _, _ in pairs:
+                        r_txt = f"r={r:.3f}" if r is not None else "r=계산불가"
+                        titles.append(f"{xl} vs {yl}<br><sup>{r_txt}</sup>")
+
+                    fig_corr = make_subplots(
+                        rows=nrows, cols=ncols,
+                        subplot_titles=titles,
+                        horizontal_spacing=0.08,
+                        vertical_spacing=0.20 if nrows > 1 else 0.1,
+                    )
+
+                    for idx, (xl, yl, r, slope, intercept, valid) in enumerate(pairs):
+                        row = idx // ncols + 1
+                        col = idx % ncols + 1
+                        if len(valid) >= 1:
+                            fig_corr.add_trace(
+                                go.Scatter(
+                                    x=valid[xl].values,
+                                    y=valid[yl].values,
+                                    mode="markers",
+                                    marker=dict(
+                                        color=PALETTE[idx % len(PALETTE)],
+                                        size=8, opacity=0.7,
+                                        line=dict(width=0.5, color="white"),
+                                    ),
+                                    name=f"{xl} vs {yl}",
+                                    hovertemplate=f"{xl}: %{{x}}<br>{yl}: %{{y}}<extra></extra>",
+                                    showlegend=False,
+                                ),
+                                row=row, col=col,
+                            )
+                        if r is not None:
+                            xx = valid[xl].values.astype(float)
+                            line_x = np.array([xx.min(), xx.max()])
+                            line_y = slope * line_x + intercept
+                            fig_corr.add_trace(
+                                go.Scatter(
+                                    x=line_x, y=line_y,
+                                    mode="lines",
+                                    line=dict(color="red", dash="dash", width=2),
+                                    name=f"추세선 (기울기={slope:.3f})",
+                                    hovertemplate=f"기울기={slope:.3f}<extra></extra>",
+                                    showlegend=False,
+                                ),
+                                row=row, col=col,
+                            )
+                        fig_corr.update_xaxes(title_text=xl, row=row, col=col)
+                        fig_corr.update_yaxes(title_text=yl, row=row, col=col)
+
+                    fig_corr.update_annotations(font_size=13)
                     fig_corr.update_layout(
-                        showlegend=True,
-                        font=dict(family="Malgun Gothic, Apple SD Gothic Neo, sans-serif"),
-                        height=420,
-                        margin=dict(l=50, r=30, t=60, b=40),
+                        showlegend=False,
+                        font=dict(family=FONT_FAMILY),
+                        height=380 * nrows,
+                        margin=dict(l=50, r=30, t=80, b=50),
                     )
                     st.plotly_chart(fig_corr, width="stretch")
 
-                # ── 상관계수 표 ────────────────────────────────────────────
-                if pairs_with_r:
-                    rows = []
-                    for xl, yl, r, valid in pairs_with_r:
-                        n_pts = len(valid)
-                        if r >= 0.7:
-                            interp = "강한 양의 상관 ✅"
-                        elif r >= 0.3:
-                            interp = "약한 양의 상관"
-                        elif r > -0.3:
-                            interp = "거의 상관 없음 ➖"
-                        elif r >= -0.7:
-                            interp = "약한 음의 상관"
-                        else:
-                            interp = "강한 음의 상관"
-                        rows.append({
+                    # ── 상관계수 표 ────────────────────────────────────────
+                    rows_tbl = []
+                    for xl, yl, r, slope, _, valid in pairs:
+                        rows_tbl.append({
                             "X (지상부 요소)": xl,
                             "Y (지하부 요소)": yl,
-                            "표본 수 (n)": n_pts,
-                            "상관계수 r": f"{r:.3f}",
-                            "해석": interp,
+                            "표본 수 (n)": len(valid),
+                            "상관계수 r": f"{r:.3f}" if r is not None else "-",
+                            "기울기": f"{slope:.3f}" if slope is not None else "-",
+                            "해석": interpret_r(r),
                         })
-                    if rows:
-                        st.dataframe(
-                            pd.DataFrame(rows),
-                            width="stretch",
-                            hide_index=True,
-                        )
-                    else:
-                        st.info("상관계수를 계산할 데이터가 충분하지 않아요.")
+                    st.dataframe(
+                        pd.DataFrame(rows_tbl),
+                        width="stretch",
+                        hide_index=True,
+                    )
 
-                # ── 개체번호별 생중량 상위·하위 5개체 강조 ────────────────
+                # ── 개체번호별 생중량 상위·하위 5개체 ─────────────────────
                 if "생중량" in growth_df.columns and has_id:
                     st.subheader("🏆 개체별 생중량 순위 (상위·하위 5)")
                     ranked = (
@@ -406,7 +414,7 @@ with tab2:
                             go.Bar(
                                 x=top5["개체번호"].astype(str).tolist(),
                                 y=top5["생중량"].tolist(),
-                                marker=dict(color="#2E86AB", fillcolor="#2E86AB"),
+                                marker=dict(color="#2E86AB"),
                                 name="상위",
                             ),
                             row=1, col=1,
@@ -415,13 +423,14 @@ with tab2:
                             go.Bar(
                                 x=bot5["개체번호"].astype(str).tolist(),
                                 y=bot5["생중량"].tolist(),
-                                marker=dict(color="#A23B72", fillcolor="#A23B72"),
+                                marker=dict(color="#A23B72"),
                                 name="하위",
                             ),
                             row=1, col=2,
                         )
+                        fig_rank.update_xaxes(type="category")
                         fig_rank.update_layout(
-                            font=dict(family="Malgun Gothic, Apple SD Gothic Neo, sans-serif"),
+                            font=dict(family=FONT_FAMILY),
                             height=360,
                             showlegend=False,
                         )
@@ -491,8 +500,7 @@ with tab3:
         if not growth_df.empty and "지상부 길이" in growth_df.columns:
             st.divider()
             st.subheader("📥 생육 결과 데이터 다운로드")
-            dl_df = growth_df.copy()
-            csv_bytes = dl_df.to_csv(index=False).encode("utf-8-sig")
+            csv_bytes = growth_df.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
                 label="📥 생육 결과 CSV 다운로드 (utf-8-sig)",
                 data=csv_bytes,
@@ -504,21 +512,18 @@ with tab3:
         if growth_df.empty:
             st.info("생육 CSV를 업로드하면 상관 요약 카드를 볼 수 있어요.")
         else:
-            candidate_x = ["잎 수", "지상부 길이", "지상부 질량", "생중량"]
-            candidate_y = ["지하부 길이", "지하부 질량"]
             best = None
-            best_r = -1.0
-            for xl in candidate_x:
+            best_r = None
+            for xl in ["잎 수", "지상부 길이", "지상부 질량", "생중량"]:
                 if xl not in growth_df.columns:
                     continue
-                for yl in candidate_y:
+                for yl in ["지하부 길이", "지하부 질량"]:
                     if yl not in growth_df.columns:
                         continue
-                    valid = growth_df[[xl, yl]].dropna()
-                    if len(valid) < 2:
+                    r, _, _, _ = calc_pair(growth_df, xl, yl)
+                    if r is None:
                         continue
-                    r = np.corrcoef(valid[xl], valid[yl])[0, 1]
-                    if abs(r) > abs(best_r):
+                    if best is None or abs(r) > abs(best_r):
                         best_r = r
                         best = (xl, yl)
             if best:
