@@ -1,25 +1,25 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
 import io
-from plotly.subplots import make_subplots
+import numpy as np
+import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import streamlit as st
 
-# ── 한글 폰트 CSS ──
-st.markdown(
-    """
+# ── 한글 폰트 CSS ──────────────────────────────────────────────────────────
+st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR&display=swap');
 html, body, [class*="css"] {
    font-family: 'Noto Sans KR', 'Malgun Gothic', sans-serif;
 }
 </style>
-""",
-    unsafe_allow_html=True,
-)
+""", unsafe_allow_html=True)
 
-# ── CSV 읽기 (인코딩 대응) ──
+# ── 캐시된 CSV 읽기 ────────────────────────────────────────────────────────
+@st.cache_data
 def read_csv(file):
+    if file is None:
+        return pd.DataFrame()
     data = file.getvalue()
     for enc in ("utf-8-sig", "cp949"):
         try:
@@ -28,7 +28,7 @@ def read_csv(file):
             pass
     return pd.DataFrame()
 
-# ── 열 이름 표준화 ──
+# ── 열 이름 표준화 ─────────────────────────────────────────────────────────
 def std_cols(df):
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
@@ -67,7 +67,7 @@ def std_cols(df):
             num = pd.to_numeric(
                 df[c].astype(str).str.replace(",", "")
                 .str.extract(r"(-?\d+\.?\d*)")[0],
-                errors="coerce",
+                errors="coerce"
             )
             if num.notna().mean() >= 0.5:
                 df[c] = num
@@ -79,503 +79,463 @@ def std_cols(df):
         bad = parsed.isna() & t.str.match(r"^\d{8}_\d{1,2}$")
         if bad.any():
             parts = t[bad].str.split("_", expand=True)
-            parsed[bad] = pd.to_datetime(parts[0], format="%Y%m%d") + pd.to_timedelta(parts[1].astype(int), unit="h")
+            parsed[bad] = (
+                pd.to_datetime(parts[0], format="%Y%m%d")
+                + pd.to_timedelta(parts[1].astype(int), unit="h")
+            )
         df["time"] = parsed
     return df
 
-# ── 페이지 설정 ──
-st.set_page_config(page_title="극지식물 상관관계 분석", layout="wide")
-st.title("🌱 지상부 요소로 지하부 상태 예측하기 : 극지식물 생육 상관관계 분석")
+# ── 추세선 추가 헬퍼 ───────────────────────────────────────────────────────
+def add_trendline(fig, x, y, color="red", dash="dash"):
+    valid = pd.concat([x, y], axis=1).dropna()
+    if len(valid) < 2:
+        return
+    xx = valid.iloc[:, 0].values
+    yy = valid.iloc[:, 1].values
+    slope, intercept = np.polyfit(xx, yy, 1)
+    line_x = np.array([xx.min(), xx.max()])
+    line_y = slope * line_x + intercept
+    fig.add_trace(
+        go.Scatter(
+            x=line_x, y=line_y,
+            mode="lines",
+            line=dict(color=color, dash=dash, width=2),
+            name=f"추세선 (기울기={slope:.3f})",
+            hoverinfo="skip",
+        ),
+        row=1, col=1,
+    )
 
-# ── 사이드바 ──
-st.sidebar.header("📁 데이터 업로드")
-env_file = st.sidebar.file_uploader("환경 CSV", type="csv")
-growth_file = st.sidebar.file_uploader("생육 CSV", type="csv")
+# ── 산점도 서브플롯 헬퍼 ───────────────────────────────────────────────────
+def scatter_subplot(fig, x, y, xlabel, ylabel, color="skyblue",
+                    trend=True, pos=None):
+    valid = pd.concat([x, y], axis=1).dropna()
+    if len(valid) < 2:
+        return None, None
+    xx = valid.iloc[:, 0].values
+    yy = valid.iloc[:, 1].values
+    r = np.corrcoef(xx, yy)[0, 1]
+    scatter = go.Scatter(
+        x=xx, y=yy,
+        mode="markers",
+        marker=dict(color=color, size=8, opacity=0.7, line=dict(width=0.5)),
+        name=f"{xlabel} vs {ylabel}",
+        hoverinfo="x+y",
+    )
+    fig.add_trace(scatter, row=pos[0], col=pos[1])
+    if trend:
+        add_trendline(fig, valid.iloc[:, 0], valid.iloc[:, 1])
+    return r, pos
 
-st.sidebar.markdown("### 📊 생육 측정 항목")
-metric_options = ["잎 수", "지상부 길이", "지하부 길이", "생중량"]
-selected_metrics = st.sidebar.multiselect(
-    "표시할 항목 선택",
-    metric_options,
-    default=metric_options,
+# ── 사이드바 ──────────────────────────────────────────────────────────────
+st.sidebar.title("📁 데이터 업로드")
+env_file = st.sidebar.file_uploader("환경 데이터 CSV", type="csv")
+growth_file = st.sidebar.file_uploader("생육 결과 CSV", type="csv")
+
+growth_measures = st.sidebar.multiselect(
+    "📊 생육 측정 항목 (그래프에 포함)",
+    ["잎 수", "지상부 길이", "지하부 길이", "지상부 질량", "지하부 질량", "생중량"],
+    default=["잎 수", "지상부 길이", "지하부 길이", "지상부 질량", "지하부 질량"],
 )
 
-# ── 데이터 로딩 ──
-env_df = pd.DataFrame()
-growth_df = pd.DataFrame()
-school_name = "우리 학교"
+# 데이터 로드
+with st.spinner("데이터 로딩 중..."):
+    raw_env = read_csv(env_file)
+    raw_growth = read_csv(growth_file)
+    env_df = std_cols(raw_env)
+    growth_df = std_cols(raw_growth)
 
-with st.spinner("데이터를 불러오는 중..."):
-    if env_file is not None:
-        env_df = read_csv(env_file)
-        env_df = std_cols(env_df)
-        name_part = env_file.name.split("_")[0]
-        if name_part and not name_part[0].isdigit():
-            school_name = name_part
-    if growth_file is not None:
-        growth_df = read_csv(growth_file)
-        growth_df = std_cols(growth_df)
-        name_part = growth_file.name.split("_")[0]
-        if name_part and not name_part[0].isdigit():
-            school_name = name_part
+# 학교명 추출 (파일명에서)
+def school_name(filename):
+    if filename is None:
+        return "미확인 학교"
+    base = filename.split(".")[0]
+    base = base.replace("_", " ").replace("-", " ")
+    words = base.split()
+    parts = []
+    for w in words:
+        buf = ""
+        for ch in w:
+            if ch.isupper() and buf:
+                parts.append(buf)
+                buf = ch
+            else:
+                buf += ch
+        if buf:
+            parts.append(buf)
+    return " ".join(p for p in parts if p).strip() or "미확인 학교"
 
-# ── 탭 ──
-tab1, tab2, tab3 = st.tabs(
-    ["📖 1장 핵심 질문 · 가설", "📊 2장 상관관계 분석", "🔍 3장 실생활 활용"]
-)
+school = school_name(env_file.name if env_file else growth_file.name if growth_file else None)
 
-# ═══════════════════════════════════════
-# 탭 1: 핵심 질문 · 가설
-# ═══════════════════════════════════════
+st.set_page_config(page_title="극지식물 생육 상관관계 분석", layout="wide")
+st.title("🌿 지상부 요소로 지하부 상태 예측하기: 극지식물 생육 상관관계 분석")
+st.caption(f"분석 대상: {school}")
+
+# ══════════════════════════════════════════════════════════════════════════
+# 탭 1 ─ 핵심 질문 / 실용적 이익 / 가설
+# ══════════════════════════════════════════════════════════════════════════
+tab1, tab2, tab3 = st.tabs(["1장 핵심 질문", "2장 생육 결과", "3장 실생활 활용"])
+
 with tab1:
     try:
-        st.markdown(f"### 🏫 {school_name} 극지식물 생육 연구")
+        st.info("환경 데이터가 업로드되지 않았어요. 이 탭의 내용은 생육 데이터만으로도 볼 수 있어요.")
+        st.header("1장 핵심 질문")
+        st.markdown("""
+**❓ 질문 1: 지상부(잎·줄기)를 보면 지하부(뿌리) 상태를 예측할 수 있을까?**
 
-        st.subheader("❓ 핵심 질문")
-        st.markdown(
-            """
-**이 연구에서 던지는 질문**
+극지식물은 땅 위보다 땅속 환경이 더 가혹한 경우가 많습니다.
+땅 위에서 관찰한 잎 수, 줄기 길이 같은 값으로 뿌리의 길이·질량을 대략 예측할 수 있다면,
+뿌리를 파보지 않고도 식물 건강 상태를 빠르게 가늠할 수 있습니다.
+        """)
+        st.markdown("""
+**❓ 질문 2: 잎 수와 지하부 길이는 정말 관계가 있을까?**
 
-> "지상부에서 관찰되는 특징(잎 수, 지상부 길이 등)을 알면,
-> 눈에 보이지 않는 지하부 상태(지하부 길이, 지하부 질량)를
-> 예측할 수 있을까?"
+일반적으로 잎이 많으면 뿌리도 발달했을 것 같지만, 극지방에서는 이 관계가 생각보다 약할 수 있습니다.
+실제로 이 데이터에서 두 값의 상관관계를 확인해 봅니다.
 
-이 질문은 왜 중요할까?
+**❓ 질문 3: 지상부 길이와 지하부 길이는 얼마나 강하게 연관되어 있을까?**
 
-- 극지식물은 잎과 지상부가 작아 보여도 지하부가 매우 발달한 경우가 있음
-- 지상부만 보고 지하부 상태를 추정할 수 있다면, **흙을 파지 않고도** 개체 건강 상태를 파악할 수 있음
-- 이는 실험 시간을 줄이고 개체를 손상시키지 않는 **비파괴 측정**으로 이어짐
-"""
-        )
+줄기가 길면 뿌리도 깊게 뻗는다는 직관이 맞는지, 상관계수로 숫자로 확인합니다.
+        """)
 
-        st.subheader("💡 질문을 통해 알 수 있는 실용적 이익")
-        st.markdown(
-            """
-**이 분석을 통해 얻을 수 있는 것**
+        st.header("질문을 통해 알 수 있는 실용적 이익")
+        st.markdown("""
+- **비파괴 측정 가능**: 뿌리를 캐내지 않고 지상부만 측정해도 지하부 상태를 추정할 수 있습니다.
+- **Quick Screening**: 대량 개체 조사 시 시간이 크게 절약됩니다.
+- **생육 이상 조기 감지**: 지상부 대비 지하부가 불균형한 개체를 골라낼 수 있습니다.
+        """)
 
-1. **측정 효율 향상**
-   - 지하부 측정은 식물을 캐내야 해서 시간이 오래 걸림
-   - 지상부 특징과의 상관관계를 알면, 일부 개체만 정밀 측정하고 나머지는 추정 가능
-
-2. **개체 선발의 객관성**
-   - "잎이 많으니까 지하부도 튼튼할 것"이라는 막연한 예상을 **수치로 검증**
-   - 상관계수가 높으면 예측에 대한 확신이 생기고, 낮으면 다른 지표를 찾아야 한다는 결론
-
-3. **실험 설계 개선**
-   - 어떤 지상부 지표가 지하부와 가장 관련이 높은지 알면, 다음 실험에서 그 지표를 집중 측정
-   - 자원(시간·노력)을 가장 효율적인 곳에 배분
-"""
-        )
-
-        st.subheader("🧪 가설")
-        st.markdown(
-            """
-**가설 1: 지하부 길이 vs 잎 수**
-
-- 예측: **약한 양의 상관관계** 또는 **상관관계가 거의 없을 것**
-- 이유: 극지식물은 잎 수가 적어도 지하부가 길 수 있고, 잎이 많아도 지하부가 짧을 수 있음
-- 지상부 잎 수는 광합성 기관이지만, 지하부 길이와 직접 연동되지 않을 가능성이 큼
-
-**가설 2: 지하부 길이 vs 지상부 길이**
-
-- 예측: **강한 양의 상관관계**가 있을 것
-- 이유: 지상부가 길다는 것은 전체 식물체가 크다는 뜻 → 지하부도 함께 발달했을 가능성이 높음
-- 식물의 전체 크기와 지하부 길이는 일반적으로 함께 증가하는 경향
-
-**가설 3 (확장): 지상부 길이 + 잎 수로 지하부 길이 예측**
-
-- 두 지상부 지표를 함께 쓰면 지하부 길이 예측 정확도가 올라갈 가능성
-- 다만 이 분석에서는 개별 상관관계(산점도 + 상관계수)로 먼저 확인
-"""
-        )
-
-        st.subheader("📌 통계 용어 설명")
-        st.markdown(
-            """
-- **상관계수(r)**: 두 변수의 관계를 -1 ~ 1로 나타냄
-  - 1에 가까울수록 함께 증가 (양의 상관)
-  - -1에 가까울수록 한쪽 증가 시 다른 쪽 감소 (음의 상관)
-  - 0에 가까울수록 관계 없음
-- **산점도**: 두 변수의 관계를 점(dot)으로 나타낸 그래프
-  - 점이 우상향 직선 모양이면 양의 상관, 우하향이면 음의 상관
-- **추세선**: 산점도 점들의 경향을 나타내는 직선 (여기서는 np.polyfit으로 계산)
-- **결정계수(R²)**: 추세선이 데이터를 얼마나 잘 설명하는지 (0 ~ 1)
-"""
-        )
-
-        # 데이터 준비 상태 표시
-        if growth_df.empty:
-            st.info("생육 CSV를 업로드하면 위 가설을 실제 데이터로 검증할 수 있습니다.")
-        else:
-            st.success(f"✅ {school_name} 생육 데이터가 로드되었습니다. 탭2에서 가설을 검증해 보세요.")
-
+        st.header("가설")
+        st.markdown("""
+| 가설 | 내용 |
+|------|------|
+| 가설 1 | 잎 수가 많을수록 지하부 길이도 길어질 것이다 (약한 양의 상관관계 예상) |
+| 가설 2 | 지상부 길이가 길수록 지하부 길이도 길어질 것이다 (강한 양의 상관관계 예상) |
+| 가설 3 | 지상부 질량·지하부 질량도 지상부 길이와 유사한 패턴을 보일 것이다 |
+        """)
     except Exception as e:
         st.warning(f"⚠️ 이 부분은 데이터 형식 때문에 표시하지 못했어요: {e}")
 
-# ═══════════════════════════════════════
-# 탭 2: 상관관계 분석 (산점도)
-# ═══════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
+# 탭 2 ─ 생육 결과 (산점도 + 상관계수)
+# ══════════════════════════════════════════════════════════════════════════
 with tab2:
     try:
         if growth_df.empty:
-            st.info(f"{school_name}의 생육 CSV를 업로드하면 여기에 상관관계 분석 결과가 표시됩니다.")
+            st.info("📎 생육 결과 CSV를 업로드하면 이 탭의 분석을 볼 수 있어요.")
         else:
-            st.subheader("🔗 상관관계 분석 개요")
-            st.markdown(
-                """
-이 탭에서는 **지상부 지표 2개**와 **지하부 지표(지하부 길이)** 의 관계를
-산점도(scatter plot)로 visualizes합니다.
+            has_id = "개체번호" in growth_df.columns
+            avail = [c for c in growth_df.columns if c != "개체번호" and c != "time"]
+            sel = [m for m in growth_measures if m in avail]
+            requested_measures = growth_measures
 
-| X 축 (지상부) | Y 축 (지하부) | 예상 상관계수 |
-|---|---|---|
-| 잎 수 | 지하부 길이 | 약함 (가설 1) |
-| 지상부 길이 | 지하부 길이 | 강함 (가설 2) |
+            st.header("2장 생육 결과 — 상관관계 분석")
 
-각 산점도에는 **추세선**과 **상관계수(r)** 가 함께 표시됩니다.
-"""
-            )
+            # ── 기본 지표 카드 ─────────────────────────────────────────────
+            if "지상부 길이" in growth_df.columns:
+                col1, col2, col3 = st.columns(3)
+                v = growth_df["지상부 길이"].dropna()
+                col1.metric("지상부 길이 평균 (mm)", f"{v.mean():.1f}")
+                col2.metric("지상부 길이 최대 (mm)", f"{v.max():.1f}")
+                col3.metric("지상부 길이 최소 (mm)", f"{v.min():.1f}")
 
-            # ── 산점도 생성 헬퍼 ──
-            def make_scatter_plot(x_col, y_col, df):
-                """x_col vs y_col 산점도 + 추세선 + 상관계수 반환"""
-                sub = df[[x_col, y_col]].dropna()
-                if len(sub) < 2:
-                    return None, None, None
-                r_val = sub[x_col].corr(sub[y_col])
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(
-                    x=sub[x_col].tolist(),
-                    y=sub[y_col].tolist(),
-                    mode="markers",
-                    marker=dict(
-                        size=10,
-                        color="#636EFA",
-                        line=dict(width=1, color="white"),
-                        opacity=0.8,
-                    ),
-                    hovertemplate=f"{x_col}: %x<br>{y_col}: %y<extra></extra>",
-                    name="개체",
-                ))
-                # 추세선 (np.polyfit)
-                mask = sub[x_col].notna() & sub[y_col].notna()
-                xc = sub[x_col][mask]
-                yc = sub[y_col][mask]
-                if len(xc) >= 2:
-                    slope, intercept = np.polyfit(xc, yc, 1)
-                    x_line = np.linspace(xc.min(), xc.max(), 100)
-                    y_line = slope * x_line + intercept
-                    r2 = r_val ** 2
-                    fig.add_trace(go.Scatter(
-                        x=x_line,
-                        y=y_line,
-                        mode="lines",
-                        line=dict(color="#EF553B", dash="dash", width=2),
-                        name=f"추세선",
-                        hovertemplate=f"기울기: {slope:.3f}<br>R²: {r2:.3f}<extra></extra>",
-                    ))
-                fig.update_layout(
-                    title=f"{x_col} vs {y_col}",
-                    xaxis_title=x_col,
-                    yaxis_title=y_col,
-                    font=dict(family="Malgun Gothic, Apple SD Gothic Neo, sans-serif"),
-                    height=400,
-                    margin=dict(l=50, r=30, t=50, b=50),
-                    showlegend=True,
-                )
-                return fig, r_val, len(sub)
+            if "지하부 길이" in growth_df.columns:
+                col1, col2, col3 = st.columns(3)
+                v = growth_df["지하부 길이"].dropna()
+                col1.metric("지하부 길이 평균 (mm)", f"{v.mean():.1f}")
+                col2.metric("지하부 길이 최대 (mm)", f"{v.max():.1f}")
+                col3.metric("지하부 길이 최소 (mm)", f"{v.min():.1f}")
 
-            # ── 산점도 1: 잎 수 vs 지하부 길이 ──
-            st.subheader("📌 산점도 1: 잎 수 vs 지하부 길이")
-            if "잎 수" in growth_df.columns and "지하부 길이" in growth_df.columns:
-                fig1, r1, n1 = make_scatter_plot("잎 수", "지하부 길이", growth_df)
-                if fig1 is not None:
-                    st.plotly_chart(fig1, width="stretch")
-                    col1a, col1b, col1c = st.columns(3)
-                    with col1a:
-                        st.metric("상관계수(r)", f"{r1:.3f}")
-                    with col1b:
-                        strength = (
-                            "강한 양의 상관" if r1 > 0.7
-                            else "약한 양의 상관" if r1 > 0.3
-                            else "상관 거의 없음" if abs(r1) < 0.3
-                            else "약한 음의 상관" if r1 > -0.7
-                            else "강한 음의 상관"
-                        )
-                        st.metric("상관 강도", strength)
-                    with col1c:
-                        st.metric("데이터 수", f"{n1}개체")
-                    st.info(
-                        "💡 가설 1 검증: 잎 수와 지하부 길이의 상관이 약하면, "
-                        "잎 수만으로는 지하부 길이를 예측하기 어렵다는 결론"
-                    )
-                else:
-                    st.info("잎 수 또는 지하부 길이 데이터가 부족합니다.")
+            # ── 하위 섹션: 그래프 대상 열 안내 ──────────────────────────────
+            gcols = [c for c in ["잎 수", "지상부 길이", "지하부 길이",
+                                  "지상부 질량", "지하부 질량", "생중량"]
+                     if c in growth_df.columns]
+
+            if not gcols:
+                st.info("생육 CSV에 분석 가능한 숫자 열이 없어요.")
             else:
-                st.info("잎 수 또는 지하부 길이 열이 데이터에 없습니다.")
-
-            st.markdown("---")
-
-            # ── 산점도 2: 지상부 길이 vs 지하부 길이 ──
-            st.subheader("📌 산점도 2: 지상부 길이 vs 지하부 길이")
-            if "지상부 길이" in growth_df.columns and "지하부 길이" in growth_df.columns:
-                fig2, r2, n2 = make_scatter_plot("지상부 길이", "지하부 길이", growth_df)
-                if fig2 is not None:
-                    st.plotly_chart(fig2, width="stretch")
-                    col2a, col2b, col2c = st.columns(3)
-                    with col2a:
-                        st.metric("상관계수(r)", f"{r2:.3f}")
-                    with col2b:
-                        strength2 = (
-                            "강한 양의 상관" if r2 > 0.7
-                            else "약한 양의 상관" if r2 > 0.3
-                            else "상관 거의 없음" if abs(r2) < 0.3
-                            else "약한 음의 상관" if r2 > -0.7
-                            else "강한 음의 상관"
-                        )
-                        st.metric("상관 강도", strength2)
-                    with col2c:
-                        st.metric("데이터 수", f"{n2}개체")
-                    st.info(
-                        "💡 가설 2 검증: 지상부 길이와 지하부 길이의 상관이 강하면, "
-                        "지상부 길이로 지하부 길이를 비교적 잘 예측할 수 있다는 결론"
+                # ── 그래프 1: 선택한 지표 분포 (박스 플롯) ────────────────
+                st.subheader("📦 개체별 생육 지표 분포")
+                num_cols = [c for c in gcols if c in growth_df.columns]
+                if num_cols:
+                    fig_box = make_subplots(
+                        rows=1, cols=len(num_cols),
+                        subplot_titles=num_cols,
+                        horizontal_spacing=0.08,
                     )
+                    colors = ["#4C72B0", "#55A868", "#C44E52",
+                              "#8172B3", "#CCB974", "#64B5CD"]
+                    for i, c in enumerate(num_cols):
+                        vals = growth_df[[c]].dropna()
+                        if has_id and "개체번호" in growth_df.columns:
+                            ids = growth_df.loc[vals.index, "개체번호"]
+                        else:
+                            ids = [str(i) for i in range(len(vals))]
+                        fig_box.add_trace(
+                            go.Box(
+                                y=vals[c].values,
+                                name=c,
+                                fillcolor=colors[i % len(colors)],
+                                marker=dict(color=colors[i % len(colors)]),
+                                line=dict(color=colors[i % len(colors)]),
+                                hovertext=list(ids),
+                                hoverinfo="y+text",
+                            ),
+                            row=1, col=i + 1,
+                        )
+                    fig_box.update_layout(
+                        showlegend=False,
+                        font=dict(family="Malgun Gothic, Apple SD Gothic Neo, sans-serif"),
+                        height=350,
+                    )
+                    st.plotly_chart(fig_box, width="stretch")
                 else:
-                    st.info("지상부 길이 또는 지하부 길이 데이터가 부족합니다.")
-            else:
-                st.info("지상부 길이 또는 지하부 길이 열이 데이터에 없습니다.")
+                    st.info("표시할 생육 숫자 열이 없어요.")
 
-            st.markdown("---")
+                # ── 산점도: 상관계수 & 추세선 ─────────────────────────────
+                st.subheader("🔗 상관관계 산점도 (추세선 + 상관계수)")
 
-            # ── 두 상관관계 비교 요약 ──
-            st.subheader("📊 두 상관관계 비교 요약")
-            if "잎 수" in growth_df.columns and "지상부 길이" in growth_df.columns and "지하부 길이" in growth_df.columns:
-                sub1 = growth_df[["잎 수", "지하부 길이"]].dropna()
-                sub2 = growth_df[["지상부 길이", "지하부 길이"]].dropna()
-                if len(sub1) >= 2 and len(sub2) >= 2:
-                    r_leaf = sub1["잎 수"].corr(sub1["지하부 길이"])
-                    r_shoot = sub2["지상부 길이"].corr(sub2["지하부 길이"])
+                # 대상 pair 결정하기
+                pairs = []
+                xlabel_candidates = ["잎 수", "지상부 길이", "지상부 질량", "생중량"]
+                ylabel_candidates = ["지하부 길이", "지하부 질량"]
+                for xl in xlabel_candidates:
+                    for yl in ylabel_candidates:
+                        if xl in growth_df.columns and yl in growth_df.columns:
+                            pairs.append((xl, yl))
 
-                    comp_rows = []
-                    comp_rows.append({
-                        "X (지상부 지표)": "잎 수",
-                        "Y (지하부 지표)": "지하부 길이",
-                        "상관계수(r)": round(r_leaf, 3),
-                        "관계 강도": (
-                            "강한 양의 상관" if r_leaf > 0.7
-                            else "약한 양의 상관" if r_leaf > 0.3
-                            else "상관 거의 없음" if abs(r_leaf) < 0.3
-                            else "약한 음의 상관" if r_leaf > -0.7
-                            else "강한 음의 상관"
-                        ),
-                        "예측 적합성": "낮음" if abs(r_leaf) < 0.5 else "보통" if abs(r_leaf) < 0.7 else "높음",
-                        "데이터 수": len(sub1),
-                    })
-                    comp_rows.append({
-                        "X (지상부 지표)": "지상부 길이",
-                        "Y (지하부 지표)": "지하부 길이",
-                        "상관계수(r)": round(r_shoot, 3),
-                        "관계 강도": (
-                            "강한 양의 상관" if r_shoot > 0.7
-                            else "약한 양의 상관" if r_shoot > 0.3
-                            else "상관 거의 없음" if abs(r_shoot) < 0.3
-                            else "약한 음의 상관" if r_shoot > -0.7
-                            else "강한 음의 상관"
-                        ),
-                        "예측 적합성": "낮음" if abs(r_shoot) < 0.5 else "보통" if abs(r_shoot) < 0.7 else "높음",
-                        "데이터 수": len(sub2),
-                    })
-                    st.dataframe(pd.DataFrame(comp_rows), width="stretch")
+                if not pairs:
+                    st.info("상관관계 분석에 필요한 열이 생육 CSV에 없어요.")
+                else:
+                    n = len(pairs)
+                    fig_corr = make_subplots(
+                        rows=1, cols=n,
+                        subplot_titles=[f"{xl} vs {yl}" for xl, yl in pairs],
+                        horizontal_spacing=0.10,
+                    )
+                    colors_list = ["#4C72B0", "#55A868", "#C44E52",
+                                   "#8172B3", "#CCB974", "#64B5CD"]
+                    for idx, (xl, yl) in enumerate(pairs):
+                        r, _ = scatter_subplot(
+                            fig_corr,
+                            growth_df[xl],
+                            growth_df[yl],
+                            xl, yl,
+                            color=colors_list[idx % len(colors_list)],
+                            trend=True,
+                            pos=(1, idx + 1),
+                        )
+                        # 상관계수 텍스트를 subplot 상단에 annotation으로 추가
+                        if r is not None:
+                            fig_corr.add_annotation(
+                                x=0.5, y=1.08, xref=f"x{idx+1} domain",
+                                yref=f"y{idx+1} domain",
+                                text=f"r = {r:.3f}",
+                                showarrow=False,
+                                font=dict(size=12,
+                                          family="Malgun Gothic, sans-serif"),
+                                yshift=8,
+                            )
+                            # 양수/음수에 따라 색 코멘트
+                            if r >= 0.7:
+                                strength = "강한 양의 상관"
+                            elif r >= 0.3:
+                                strength = "약한 양의 상관"
+                            elif r > -0.3:
+                                strength = "거의 상관 없음"
+                            elif r >= -0.7:
+                                strength = "약한 음의 상관"
+                            else:
+                                strength = "강한 음의 상관"
+                            fig_corr.add_annotation(
+                                x=0.5, y=1.0, xref=f"x{idx+1} domain",
+                                yref=f"y{idx+1} domain",
+                                text=f"{strength}",
+                                showarrow=False,
+                                font=dict(size=10,
+                                          family="Malgun Gothic, sans-serif",
+                                          color="gray"),
+                                yshift=-2,
+                            )
 
-                    # 인사이트 박스
-                    if abs(r_shoot) > abs(r_leaf):
-                        st.success(
-                            f"✅ 지상부 길이(r={r_shoot:.2f})가 잎 수(r={r_leaf:.2f})보다 "
-                            "지하부 길이와의 상관이 더 강합니다. "
-                            "지상부 길이를 지하부 예측의 주요 지표로 사용하는 것이 더 적합합니다."
+                    fig_corr.update_layout(
+                        showlegend=True,
+                        font=dict(family="Malgun Gothic, Apple SD Gothic Neo, sans-serif"),
+                        height=420,
+                        margin=dict(l=50, r=30, t=60, b=40),
+                    )
+                    st.plotly_chart(fig_corr, width="stretch")
+
+                # ── 상관계수 표 ────────────────────────────────────────────
+                if pairs:
+                    rows = []
+                    for xl, yl in pairs:
+                        valid = growth_df[[xl, yl]].dropna()
+                        if len(valid) >= 2:
+                            r = np.corrcoef(valid[xl], valid[yl])[0, 1]
+                            n_pts = len(valid)
+                            if r >= 0.7:
+                                interp = "강한 양의 상관 ✅"
+                            elif r >= 0.3:
+                                interp = "약한 양의 상관"
+                            elif r > -0.3:
+                                interp = "거의 상관 없음 ➖"
+                            elif r >= -0.7:
+                                interp = "약한 음의 상관"
+                            else:
+                                interp = "강한 음의 상관"
+                            rows.append({
+                                "X (지상부 요소)": xl,
+                                "Y (지하부 요소)": yl,
+                                "표본 수 (n)": n_pts,
+                                "상관계수 r": f"{r:.3f}",
+                                "해석": interp,
+                            })
+                    if rows:
+                        st.dataframe(
+                            pd.DataFrame(rows),
+                            width="stretch",
+                            hide_index=True,
                         )
                     else:
-                        st.info(
-                            f"잎 수(r={r_leaf:.2f})와 지상부 길이(r={r_shoot:.2f})의 "
-                            "지하부 길이에 대한 상관 정도가 비슷합니다."
+                        st.info("상관계수를 계산할 데이터가 충분하지 않아요.")
+
+                # ── 개체번호별 생중량 상위·하위 5개체 강조 (선택 시) ───────
+                if "생중량" in growth_df.columns and has_id:
+                    st.subheader("🏆 개체별 생중량 순위 (상위·하위 5)")
+                    ranked = growth_df[["개체번호", "생중량"]].dropna().sort_values("생중량", ascending=False)
+                    if len(ranked) >= 5:
+                        top5 = ranked.head(5)
+                        bot5 = ranked.tail(5).iloc[::-1]
+                        fig_rank = make_subplots(
+                            rows=1, cols=2,
+                            subplot_titles=["상위 5개체", "하위 5개체"],
+                            horizontal_spacing=0.15,
                         )
+                        fig_rank.add_trace(
+                            go.Bar(
+                                x=top5["개체번호"].astype(str).tolist(),
+                                y=top5["생중량"].tolist(),
+                                marker=dict(color="#2E86AB", fillcolor="#2E86AB"),
+                                name="상위",
+                            ),
+                            row=1, col=1,
+                        )
+                        fig_rank.add_trace(
+                            go.Bar(
+                                x=bot5["개체번호"].astype(str).tolist(),
+                                y=bot5["생중량"].tolist(),
+                                marker=dict(color="#A23B72", fillcolor="#A23B72"),
+                                name="하위",
+                            ),
+                            row=1, col=2,
+                        )
+                        fig_rank.update_layout(
+                            font=dict(family="Malgun Gothic, Apple SD Gothic Neo, sans-serif"),
+                            height=360,
+                            showlegend=False,
+                        )
+                        st.plotly_chart(fig_rank, width="stretch")
+
+            # ── 환경 데이터 요약 (있으면) ───────────────────────────────────
+            if not env_df.empty:
+                st.divider()
+                st.subheader("🌡️ 환경 데이터 간략 요약")
+                env_num = [c for c in ["temperature", "humidity", "ph", "ec"]
+                           if c in env_df.columns]
+                if env_num:
+                    evals = {}
+                    for c in env_num:
+                        v = env_df[c].dropna()
+                        if len(v) >= 2:
+                            evals[c] = {
+                                "평균": round(v.mean(), 2),
+                                "최대": round(v.max(), 2),
+                                "최소": round(v.min(), 2),
+                            }
+                    if evals:
+                        edf = pd.DataFrame(evals).T
+                        edf.index.name = "측정 항목"
+                        st.dataframe(edf, width="stretch", hide_index=False)
+                    else:
+                        st.info("환경 데이터 값이 충분치 않아요.")
                 else:
-                    st.info("비교에 필요한 데이터가 부족합니다.")
-            else:
-                st.info("비교를 위해 잎 수, 지상부 길이, 지하부 길이가 모두 필요합니다.")
-
-            # ── 개체별 측정값 테이블 ──
-            st.subheader("📄 개체별 측정값 (산점도 데이터)")
-            plot_cols = [c for c in ["개체번호", "잎 수", "지상부 길이", "지하부 길이", "생중량"] if c in growth_df.columns]
-            if plot_cols:
-                st.dataframe(growth_df[plot_cols], width="stretch")
-            else:
-                st.info("표시할 측정 항목이 없습니다.")
-
-            # ── 원본 다운로드 ──
-            with st.expander("📥 생육 데이터 CSV 다운로드"):
-                if not growth_df.empty:
-                    csv_bytes = growth_df.to_csv(index=False).encode("utf-8-sig")
-                    st.download_button(
-                        label="CSV 다운로드",
-                        data=csv_bytes,
-                        file_name=f"{school_name}_생육결과데이터.csv",
-                        mime="text/csv",
-                    )
-                else:
-                    st.info("다운로드할 데이터가 없습니다.")
-
+                    st.info("환경 CSV에 분석 가능한 숫자 열이 없어요.")
     except Exception as e:
         st.warning(f"⚠️ 이 부분은 데이터 형식 때문에 표시하지 못했어요: {e}")
 
-# ═══════════════════════════════════════
-# 탭 3: 실생활 활용
-# ═══════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
+# 탭 3 ─ 실생활 활용
+# ══════════════════════════════════════════════════════════════════════════
 with tab3:
     try:
-        st.subheader("🔍 생육 결과로부터 산출한 요소별 실생활 대입")
+        st.header("3장 생육 결과에 대한 실생활 활용")
 
+        st.markdown("""
+**🌱 토양 건강 모니터링에 활용**
+
+지상부 길이(줄기)와 지하부 길이(뿌리)의 강한 양의 상관관계가 확인되면,
+줄기 길이만으로 뿌리의 발달 정도를 추정할 수 있어 토양 깊이에 따른 식물 반응을
+빠르고 비파괴적으로 추적할 수 있습니다.
+        """)
+
+        st.markdown("""
+**🧪 극지 연구 샘플링 전략 개선**
+
+잎 수와 지하부 길이 사이에 상관이 약하다면,
+잎 수만으로 뿌리 발달을 판단하는 것은 부정확할 수 있습니다.
+이런 결과는 현장 조사 시 어떤 지표를 우선시할지 결정하는 근거가 됩니다.
+        """)
+
+        st.markdown("""
+**📋 교육용 생육 추적 프로젝트**
+
+학생들이 개체를 파종부터 수확까지 추적하며 측정하는 프로젝트에서,
+이 대시보드를 통해 지상부-지하부의 관계를 직접 시각화할 수 있습니다.
+상관계수와 추세선을 함께 보면서 통계적 사고도 익힐 수 있습니다.
+        """)
+
+        # ── 생육 결과 다운로드 ────────────────────────────────────────────
+        if not growth_df.empty and "지상부 길이" in growth_df.columns:
+            st.divider()
+            st.subheader("📥 생육 결과 데이터 다운로드")
+            dl_df = growth_df.copy()
+            csv_bytes = dl_df.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                label="📥 생육 결과 CSV 다운로드 (utf-8-sig)",
+                data=csv_bytes,
+                file_name="극지식물_생육결과.csv",
+                mime="text/csv",
+            )
+
+        # ── Correlation summary 카드 ──────────────────────────────────────
         if growth_df.empty:
-            st.info("생육 CSV를 업로드하면 실생활 활용 예시가 여기에 표시됩니다.")
+            st.info("생육 CSV를 업로드하면 상관 요약 카드를 볼 수 있어요.")
         else:
-            # 데이터 기반 수치 계산
-            has_shoot_len = "지상부 길이" in growth_df.columns
-            has_root_len = "지하부 길이" in growth_df.columns
-            has_leaves = "잎 수" in growth_df.columns
-            has_bw = "생중량" in growth_df.columns
-
-            st.markdown(
-                """
-### 🌿 실생활 활용 아이디어
-
-이 분석에서 얻은 상관관계 결과를 실제 상황에 적용하면
-다음과 같은 활용이 가능합니다.
-"""
-            )
-
-            # 활용 1: 비파괴 개체 선발
-            st.subheader("1️⃣ 비파괴 개체 선발 도구")
-            if has_shoot_len and has_root_len:
-                sub = growth_df[["지상부 길이", "지하부 길이"]].dropna()
-                if len(sub) >= 2:
-                    r_val = sub["지상부 길이"].corr(sub["지하부 길이"])
-                    st.markdown(
-                        f"""
-**상황:** 실험실에서 극지식물 개체 중 "건강하고 잘 자란 개체"를 골라야 할 때,
-지하부를 확인하려면 식물을 캐내야 해서 개체가 손상됨.
-
-**활용:** 지상부 길이만 측정해도 지하부 길이를 추정할 수 있다면
-**개체를 손상시키지 않고** 건강한 개체를 고를 수 있음.
-
-- 우리 학교 데이터: 지상부 길이-지하부 길이 상관계수 **r = {r_val:.2f}**
-- r이 {0.7 if r_val>0.7 else 0.5 if r_val>0.5 else 0.3} 이상이면 → 지상부 길이로 지하부 길이 예측 가능
-- 추청 공식(추세선): **지하부 길이 ≈ {sub["지상부 길이"].corr(sub["지하부 길이"]) * (sub["지상부 길이"].std()/sub["지상부 길이"].std()):.2f} × 지상부 길이 + 상수**
-  (실제 상수는 추세선의 절편으로 계산)
-                        """
-                    )
-                else:
-                    st.info("상관계수를 계산할 데이터가 부족합니다.")
-            else:
-                st.info("지상부 길이와 지하부 길이 데이터가 모두 필요합니다.")
-
-            # 활용 2: 측정 항목 최적화
-            st.subheader("2️⃣ 측정 항목 최적화 (시간 절약)")
-            st.markdown(
-                """
-**상황:** 실험 시간이 부족해서 모든 개체의 모든 부분을 측정할 수 없을 때,
-어떤 항목을 우선 측정할지 결정해야 함.
-
-**활용:**
-
-| 지상부 지표 | 지하부 예측 유용성 | 측정 난이도 | 추천 우선순위 |
-|---|---|---|---|
-| 지상부 길이 | 높음 (r이 큰 경향) | 낮음 (자 하나로 측정) | ⭐⭐⭐⭐⭐ |
-| 잎 수 | 낮음 (r이 작은 경향) | 낮음 (세는 방식) | ⭐⭐ |
-
-- 지상부 길이는 측정도 쉽고 지하부와의 상관도 높은 편 → **우선 측정 지표**
-- 잎 수는 측정은 쉽지만 지하부 예측력은 낮은 경향 → 참고용으로만 활용
-"""
-            )
-
-            # 활용 3: 생장 예측 모델 기초
-            st.subheader("3️⃣ 생장 예측 모델의 기초 자료")
-            if has_shoot_len and has_root_len:
-                sub = growth_df[["지상부 길이", "지하부 길이"]].dropna()
-                if len(sub) >= 3:
-                    slope, intercept = np.polyfit(sub["지상부 길이"], sub["지하부 길이"], 1)
-                    st.markdown(
-                        f"""
-**상황:** 앞으로 기를 극지식물의 지하부 길이를 미리 알고 싶을 때,
-지상부 길이만 재면 대략적인 지하부 길이를 예측 가능.
-
-**추정 공식 (우리 학교 데이터 기준):**
-
-> **지하부 길이(mm) ≈ {slope:.2f} × 지상부 길이(mm) + {intercept:.2f}**
-
-- 이 공식은 **우리 학교 개체들의 데이터**로 만든 것이므로,
-  다른 학교·환경에서는 달라질 수 있음
-- 새로운 개체의 지상부 길이를 재서 위 공식에 넣으면
-  지하부 길이 추정치를 얻을 수 있음
-- 단, 이는 **추정**일 뿐 실제 측정과 오차가 있을 수 있으니 주의
-                        """
-                    )
-                else:
-                    st.info("추세선을 만들 데이터가 부족합니다.")
-            else:
-                st.info("지상부 길이와 지하부 길이 데이터가 모두 필요합니다.")
-
-            # 활용 4: 교육적 활용
-            st.subheader("4️⃣ 통계·과학 교육 활용")
-            st.markdown(
-                """
-**이 분석을 과학 수업에서 활용할 수 있는 방법:**
-
-1. **가설 설정 연습**
-   - "잎 수가 많으면 지하부도 길까?" 같은 가설을 세우고, 실제 데이터로 검증
-   - 가설이 맞았을 때와 틀렸을 때 모두 배울 점이 있음
-
-2. **상관관계 vs 인과관계 구분**
-   - 상관이 있다고 해서 "잎 수가 지하부 길이를 CAUSED한다"는 아님
-   - 둘 다 전체 식물 크기가 커서 함께 증가한 것일 수 있음
-   - 이 차이를 배우는 것이 과학적 사고력 향상에 도움
-
-3. **데이터 시각화 해석**
-   - 산점도 점의 분포를 보고 상관의 방향과 강도를 읽는 연습
-   - 추세선과 상관계수를 함께 보는 습관
-"""
-            )
-
-            # 요약 카드
-            st.subheader("📋 연구 요약 카드")
-            c1, c2, c3 = st.columns(3)
-
-            with c1:
-                st.markdown("#### 🔬 연구 질문")
-                st.write(
-                    "지상부 특징(잎 수, 지상부 길이)으로\n"
-                    "지하부 상태(지하부 길이)를\n"
-                    "예측할 수 있을까?"
+            candidate_x = ["잎 수", "지상부 길이", "지상부 질량", "생중량"]
+            candidate_y = ["지하부 길이", "지하부 질량"]
+            best = None
+            best_r = -1.0
+            for xl in candidate_x:
+                if xl not in growth_df.columns:
+                    continue
+                for yl in candidate_y:
+                    if yl not in growth_df.columns:
+                        continue
+                    valid = growth_df[[xl, yl]].dropna()
+                    if len(valid) < 2:
+                        continue
+                    r = np.corrcoef(valid[xl], valid[yl])[0, 1]
+                    if abs(r) > abs(best_r):
+                        best_r = r
+                        best = (xl, yl)
+            if best:
+                xl, yl = best
+                st.metric(
+                    label=f"가장 강한 상관: {xl} ↔ {yl}",
+                    value=f"r = {best_r:.3f}",
+                    delta=None,
                 )
-
-            with c2:
-                st.markdown("#### 📊 핵심 발견")
-                if has_shoot_len and has_root_len:
-                    sub = growth_df[["지상부 길이", "지하부 길이"]].dropna()
-                    if len(sub) >= 2:
-                        r_shoot = sub["지상부 길이"].corr(sub["지하부 길이"])
-                        st.write(f"지상부 길이 ↔ 지하부 길이\n**r = {r_shoot:.2f}**")
-                    else:
-                        st.write("데이터 부족")
-                else:
-                    st.write("데이터 없음")
-
-            with c3:
-                st.markdown("#### 🛠️ 실용 가치")
-                st.write(
-                    "• 비파괴 개체 선발\n"
-                    "• 측정 항목 최적화\n"
-                    "• 생장 추정 공식\n"
-                    "• 과학 교육 자료"
-                )
-
     except Exception as e:
         st.warning(f"⚠️ 이 부분은 데이터 형식 때문에 표시하지 못했어요: {e}")
