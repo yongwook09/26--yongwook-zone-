@@ -150,9 +150,10 @@ with st.spinner("데이터 로딩 중..."):
 def school_name(filename):
     if filename is None:
         return "미확인 학교"
-    base = filename.split(".")[0]
+    base = filename.split(".")[0]           # 확장자 제거
     base = base.replace("_", " ").replace("-", " ")
     words = base.split()
+    # 영문 파스칼/카멜 케이스 분할
     parts = []
     for w in words:
         buf = ""
@@ -184,7 +185,7 @@ with tab1:
         st.markdown("""
 **❓ 질문 1: 지상부(잎·줄기)를 보면 지하부(뿌리) 상태를 예측할 수 있을까?**
 
-극지식물은 땅 위보다 땅속 환경이 더 가혹한 경우가 많습니다.
+극지식물은 땅 위보다 땅속 환경이 더 가혹한 경우가 많습니다.  
 땅 위에서 관찰한 잎 수, 줄기 길이 같은 값으로 뿌리의 길이·질량을 대략 예측할 수 있다면,
 뿌리를 파보지 않고도 식물 건강 상태를 빠르게 가늠할 수 있습니다.
         """)
@@ -513,6 +514,7 @@ with tab3:
         if growth_df.empty:
             st.info("생육 CSV를 업로드하면 상관 요약 카드를 볼 수 있어요.")
         else:
+            # r 값이 제일 높은 pair 찾기
             candidate_x = ["잎 수", "지상부 길이", "지상부 질량", "생중량"]
             candidate_y = ["지하부 길이", "지하부 질량"]
             best = None
