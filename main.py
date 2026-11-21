@@ -236,7 +236,6 @@ with tab2:
         if growth_df.empty:
             st.info("📎 생육 결과 CSV를 업로드하면 이 탭의 분석을 볼 수 있어요.")
         else:
-            has_id = "개체번호" in growth_df.columns
 
             st.header("2장 생육 결과 — 상관관계 분석")
 
@@ -259,45 +258,7 @@ with tab2:
             if not gcols:
                 st.info("표시할 생육 측정 항목이 없어요. 사이드바에서 항목을 선택하거나 CSV의 열 이름을 확인해 주세요.")
             else:
-                # ── 그래프 1: 개체별 지표 분포 (박스 플롯) ────────────────
-                st.subheader("📦 개체별 생육 지표 분포")
-                n_box = len(gcols)
-                box_cols = min(n_box, 3)
-                box_rows = math.ceil(n_box / box_cols)
-                fig_box = make_subplots(
-                    rows=box_rows, cols=box_cols,
-                    subplot_titles=gcols,
-                    horizontal_spacing=0.08,
-                    vertical_spacing=0.18 if box_rows > 1 else 0.1,
-                )
-                for i, col_name in enumerate(gcols):
-                    vals = growth_df[[col_name]].dropna()
-                    if has_id:
-                        ids = growth_df.loc[vals.index, "개체번호"].astype(str).tolist()
-                    else:
-                        ids = [str(j) for j in range(len(vals))]
-                    color = PALETTE[i % len(PALETTE)]
-                    fig_box.add_trace(
-                        go.Box(
-                            y=vals[col_name].values,
-                            name=col_name,
-                            fillcolor=color,
-                            marker=dict(color=color),
-                            line=dict(color=color),
-                            hovertext=ids,
-                            hoverinfo="y+text",
-                        ),
-                        row=i // box_cols + 1, col=i % box_cols + 1,
-                    )
-                fig_box.update_layout(
-                    showlegend=False,
-                    font=dict(family=FONT_FAMILY),
-                    height=320 * box_rows,
-                    margin=dict(l=40, r=20, t=60, b=30),
-                )
-                st.plotly_chart(fig_box, width="stretch")
-
-                # ── 그래프 2: 상관관계 산점도 (격자 배치) ─────────────────
+                # ── 상관관계 산점도 (격자 배치) ─────────────────
                 st.subheader("🔗 상관관계 산점도 (추세선 + 상관계수)")
 
                 x_candidates = [c for c in ["잎 수", "지상부 길이", "지상부 질량", "생중량"]
@@ -394,47 +355,6 @@ with tab2:
                         hide_index=True,
                     )
 
-                # ── 개체번호별 생중량 상위·하위 5개체 ─────────────────────
-                if "생중량" in growth_df.columns and has_id:
-                    st.subheader("🏆 개체별 생중량 순위 (상위·하위 5)")
-                    ranked = (
-                        growth_df[["개체번호", "생중량"]]
-                        .dropna()
-                        .sort_values("생중량", ascending=False)
-                    )
-                    if len(ranked) >= 5:
-                        top5 = ranked.head(5)
-                        bot5 = ranked.tail(5).iloc[::-1]
-                        fig_rank = make_subplots(
-                            rows=1, cols=2,
-                            subplot_titles=["상위 5개체", "하위 5개체"],
-                            horizontal_spacing=0.15,
-                        )
-                        fig_rank.add_trace(
-                            go.Bar(
-                                x=top5["개체번호"].astype(str).tolist(),
-                                y=top5["생중량"].tolist(),
-                                marker=dict(color="#2E86AB"),
-                                name="상위",
-                            ),
-                            row=1, col=1,
-                        )
-                        fig_rank.add_trace(
-                            go.Bar(
-                                x=bot5["개체번호"].astype(str).tolist(),
-                                y=bot5["생중량"].tolist(),
-                                marker=dict(color="#A23B72"),
-                                name="하위",
-                            ),
-                            row=1, col=2,
-                        )
-                        fig_rank.update_xaxes(type="category")
-                        fig_rank.update_layout(
-                            font=dict(family=FONT_FAMILY),
-                            height=360,
-                            showlegend=False,
-                        )
-                        st.plotly_chart(fig_rank, width="stretch")
 
             # ── 환경 데이터 요약 ───────────────────────────────────────────
             if not env_df.empty:
@@ -472,29 +392,139 @@ with tab3:
     try:
         st.header("3장 생육 결과에 대한 실생활 활용")
 
-        st.markdown("""
-**🌱 토양 건강 모니터링에 활용**
+        # ── 목적 (가장 먼저, 분명하게) ────────────────────────────────────
+        st.success(
+            "🎯 **이 프로젝트의 목적**\n\n"
+            "**지상부(잎 수·줄기 길이·지상부 질량)를 봄으로써 지하부(뿌리 길이·질량)의 상태를 예측할 수 있다.**\n\n"
+            "뿌리를 캐내지 않고 땅 위에서 관찰한 값만으로 식물의 땅속 상태를 알아내는 것, "
+            "이것이 우리가 이 분석을 하는 이유입니다."
+        )
 
-지상부 길이(줄기)와 지하부 길이(뿌리)의 강한 양의 상관관계가 확인되면,
-줄기 길이만으로 뿌리의 발달 정도를 추정할 수 있어 토양 깊이에 따른
-식물 반응을 빠르고 비파괴적으로 추적할 수 있습니다.
+        # ── 이 데이터로 확인한 결과 ───────────────────────────────────────
+        # 생중량은 지하부 질량을 포함한 값이라 예측 근거에서 제외합니다.
+        pred_pairs = []
+        if not growth_df.empty:
+            for xl in ["잎 수", "지상부 길이", "지상부 질량"]:
+                if xl not in growth_df.columns:
+                    continue
+                for yl in ["지하부 길이", "지하부 질량"]:
+                    if yl not in growth_df.columns:
+                        continue
+                    r, slope, intercept, valid = calc_pair(growth_df, xl, yl)
+                    if r is not None:
+                        pred_pairs.append((xl, yl, r, slope, intercept, valid))
+
+        st.subheader("📊 우리 데이터로 확인한 결과")
+        if growth_df.empty:
+            st.info("생육 CSV를 업로드하면 '지상부로 지하부를 예측할 수 있는지'를 데이터로 확인할 수 있어요.")
+        elif not pred_pairs:
+            st.info("예측 근거를 계산할 열(지상부·지하부 길이/질량)이 생육 CSV에 부족해요.")
+        else:
+            tbl = []
+            for xl, yl, r, slope, _, valid in pred_pairs:
+                if abs(r) >= 0.7:
+                    power = "예측에 활용 가능 ✅"
+                elif abs(r) >= 0.3:
+                    power = "참고용 (오차 클 수 있음)"
+                else:
+                    power = "예측 어려움 ➖"
+                tbl.append({
+                    "지상부 요소 (보는 값)": xl,
+                    "지하부 요소 (예측할 값)": yl,
+                    "표본 수 (n)": len(valid),
+                    "상관계수 r": f"{r:.3f}",
+                    "설명력 R²": f"{r * r:.2f}",
+                    "예측 가능성": power,
+                })
+            st.dataframe(pd.DataFrame(tbl), width="stretch", hide_index=True)
+
+            best = max(pred_pairs, key=lambda p: abs(p[2]))
+            bx, by, br = best[0], best[1], best[2]
+            if abs(br) >= 0.7 and br > 0:
+                st.success(
+                    f"✅ **결론: 지상부로 지하부를 예측할 수 있습니다.** "
+                    f"가장 강한 관계는 **{bx} → {by}** (r = {br:.3f}, R² = {br * br:.2f})입니다. "
+                    f"{bx}만 측정해도 {by}의 약 {br * br * 100:.0f}%가 설명됩니다."
+                )
+            elif abs(br) >= 0.3:
+                st.warning(
+                    f"⚠️ **결론: 부분적으로만 예측할 수 있습니다.** "
+                    f"가장 강한 관계는 **{bx} → {by}** (r = {br:.3f}, R² = {br * br:.2f})로, "
+                    f"대략적인 경향을 보는 참고용으로만 쓰는 것이 좋습니다."
+                )
+            else:
+                st.error(
+                    f"❌ **결론: 이 데이터에서는 지상부로 지하부를 예측하기 어렵습니다.** "
+                    f"가장 강한 관계도 {bx} → {by} (r = {br:.3f})로 약합니다."
+                )
+
+            # ── 지상부 값으로 지하부 예측해 보기 ──────────────────────────
+            st.subheader("🧮 지상부 값으로 지하부 예측해 보기")
+            labels = [f"{p[0]} → {p[1]} (r={p[2]:.3f})" for p in pred_pairs]
+            default_idx = pred_pairs.index(best)
+            choice = st.selectbox("예측할 관계 선택", labels, index=default_idx)
+            xl, yl, r, slope, intercept, valid = pred_pairs[labels.index(choice)]
+            x_min = float(valid[xl].min())
+            x_max = float(valid[xl].max())
+            x_val = st.number_input(
+                f"{xl} 값 입력",
+                value=float(round(valid[xl].mean(), 2)),
+                step=0.1,
+            )
+            y_pred = slope * x_val + intercept
+            st.metric(f"예측된 {yl}", f"{y_pred:.2f}")
+            if x_val < x_min or x_val > x_max:
+                st.warning(
+                    f"입력값이 측정 범위({x_min:.1f} ~ {x_max:.1f})를 벗어나 예측이 부정확할 수 있어요."
+                )
+            st.caption(
+                f"예측식: {yl} = {slope:.3f} × {xl} + {intercept:.3f}  |  R² = {r * r:.2f}"
+            )
+
+        # ── 실생활 활용 ───────────────────────────────────────────────────
+        st.subheader("🌍 이렇게 활용할 수 있어요")
+
+        st.markdown("""
+**🌱 뿌리를 캐지 않는 비파괴 생육 진단**
+
+땅 위의 줄기 길이·잎 수만 재고도 뿌리의 길이와 질량을 추정할 수 있다면, 식물을
+뽑아 죽이지 않고 같은 개체를 계속 관찰할 수 있습니다. 개체 수가 적고 소중한
+극지식물 연구에서 특히 큰 장점입니다.
         """)
 
         st.markdown("""
-**🧪 극지 연구 샘플링 전략 개선**
+**⚡ 대량 개체 빠른 선별 (Quick Screening)**
 
-잎 수와 지하부 길이 사이에 상관이 약하다면, 잎 수만으로 뿌리 발달을
-판단하는 것은 부정확할 수 있습니다. 이런 결과는 현장 조사 시 어떤
-지표를 우선시할지 결정하는 근거가 됩니다.
+많은 개체를 조사할 때 지상부만 측정해 지하부 상태를 먼저 추정하고, 예상과 크게
+다른 개체만 골라 정밀 조사하면 시간과 노력을 크게 줄일 수 있습니다.
+        """)
+
+        st.markdown("""
+**🚨 생육 이상 조기 발견**
+
+지상부 값으로 예측한 지하부 값과 실제 값이 크게 다른 개체는 뿌리 발달에 문제가
+있을 가능성이 있습니다. 이런 개체를 일찍 찾아 환경(온도·습도·pH·EC)을 점검할 수
+있습니다.
+        """)
+
+        st.markdown("""
+**🧪 현장 조사 지표 선택의 근거**
+
+위 표에서 상관이 강한 지상부 요소는 현장에서 우선 측정할 지표로, 상관이 약한
+요소는 단독 판단 지표로 쓰지 말아야 할 지표로 구분할 수 있습니다.
         """)
 
         st.markdown("""
 **📋 교육용 생육 추적 프로젝트**
 
-학생들이 개체를 파종부터 수확까지 추적하며 측정하는 프로젝트에서,
-이 대시보드를 통해 지상부-지하부의 관계를 직접 시각화할 수 있습니다.
-상관계수와 추세선을 함께 보면서 통계적 사고도 익힐 수 있습니다.
+학생들이 직접 측정한 값으로 상관계수와 예측식을 만들어 보며, 데이터로 가설을
+검증하는 과정을 경험할 수 있습니다.
         """)
+
+        st.caption(
+            "※ 상관관계는 인과관계가 아니며, 예측식은 이 데이터의 측정 범위와 표본 수 안에서만 믿을 수 있어요. "
+            "표본이 적으면 결과가 크게 달라질 수 있습니다."
+        )
 
         # ── 생육 결과 다운로드 ────────────────────────────────────────────
         if not growth_df.empty and "지상부 길이" in growth_df.columns:
@@ -507,30 +537,5 @@ with tab3:
                 file_name="극지식물_생육결과.csv",
                 mime="text/csv",
             )
-
-        # ── 가장 강한 상관 카드 ───────────────────────────────────────────
-        if growth_df.empty:
-            st.info("생육 CSV를 업로드하면 상관 요약 카드를 볼 수 있어요.")
-        else:
-            best = None
-            best_r = None
-            for xl in ["잎 수", "지상부 길이", "지상부 질량", "생중량"]:
-                if xl not in growth_df.columns:
-                    continue
-                for yl in ["지하부 길이", "지하부 질량"]:
-                    if yl not in growth_df.columns:
-                        continue
-                    r, _, _, _ = calc_pair(growth_df, xl, yl)
-                    if r is None:
-                        continue
-                    if best is None or abs(r) > abs(best_r):
-                        best_r = r
-                        best = (xl, yl)
-            if best:
-                xl, yl = best
-                st.metric(
-                    label=f"가장 강한 상관: {xl} ↔ {yl}",
-                    value=f"r = {best_r:.3f}",
-                )
     except Exception as e:
         st.warning(f"⚠️ 이 부분은 데이터 형식 때문에 표시하지 못했어요: {e}")
